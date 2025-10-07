@@ -62,7 +62,7 @@ app.post("/vcp/command/:vehicleId/:command", async (req, res) => {
   const signatureB64Url = signMessageBase64Url(messageB64Url);
 
   // Tesla Fleet Gateway WS
-  const wsUrl = `wss://fleet-gateway.prd.${TESLA_REGION}.vn.cloud.tesla.com/v1`;
+  const wsUrl = `wss://fleet-vehicle-command.prd.${TESLA_REGION}.vn.cloud.tesla.com/v1`;
 
   // Build frames
   const handshake = {
