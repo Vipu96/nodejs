@@ -14,7 +14,7 @@ app.post("/command/:vehicleId/:command", async (req, res) => {
   }
 
   const region = "eu";
-  const wsUrl = `wss://fleet-gateway.prd.${region}.vn.cloud.tesla.com/v1`;
+  const wsUrl = `wss://fleet-gateway.prd.${region}.teslaapis.com/v1`;
 
   try {
     const handshake = {
