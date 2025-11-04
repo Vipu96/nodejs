@@ -1,139 +1,78 @@
 import express from "express";
-import cors from "cors";
-import crypto from "crypto";
 import WebSocket from "ws";
+import crypto from "crypto";
 
 const app = express();
-app.use(cors());
 app.use(express.json());
 
-// === Environment variables ===
-const TESLA_PRIVATE_KEY = process.env.TESLA_PRIVATE_KEY;    // EC P-256 private key (PEM)
-const TESLA_PUBLIC_KEY  = process.env.TESLA_PUBLIC_KEY;     // EC P-256 public key (PEM)
-const TESLA_REGION      = process.env.TESLA_REGION || "eu"; // "eu" / "na"
-const TESLA_DOMAIN      = process.env.TESLA_DOMAIN || "myspot.fi"; // sama domain kuin avain on lisätty
-
-// === Utility functions ===
-function b64url(buf) {
-  return Buffer.from(buf)
-    .toString("base64")
-    .replace(/\+/g, "-")
-    .replace(/\//g, "_")
-    .replace(/=+$/g, "");
-}
-
-function signMessageBase64Url(messageB64Url) {
-  const sign = crypto.createSign("sha256");
-  sign.update(messageB64Url);
-  sign.end();
-  const sigDER = sign.sign(TESLA_PRIVATE_KEY); // returns DER
-  return b64url(sigDER);
-}
-
-// === Root endpoint ===
-app.get("/", (_req, res) => {
-  res.send("🚀 Tesla VCP proxy is up. Routes: /.well-known/... , POST /vcp/command/:vehicleId/:command");
-});
-
-// === Tesla public key endpoint ===
-app.get("/.well-known/appspecific/com.tesla.3p.public-key.pem", (_req, res) => {
-  if (!TESLA_PUBLIC_KEY) return res.status(500).send("TESLA_PUBLIC_KEY not set");
-  res.type("application/x-pem-file").send(TESLA_PUBLIC_KEY);
-});
-
-// === Vehicle Command Protocol endpoint ===
-app.post("/vcp/command/:vehicleId/:command", async (req, res) => {
+app.post("/command/:vehicleId/:command", async (req, res) => {
   const { vehicleId, command } = req.params;
-  const auth = req.headers.authorization || "";
+  const { token, params, privateKeyPem, domain } = req.body;
 
-  if (!auth.startsWith("Bearer ")) {
-    return res.status(401).json({ ok: false, error: "Missing or invalid Authorization header" });
-  }
-  if (!TESLA_PRIVATE_KEY) {
-    return res.status(500).json({ ok: false, error: "TESLA_PRIVATE_KEY not configured" });
+  if (!token || !privateKeyPem || !domain) {
+    return res.status(400).json({ error: "Missing required fields" });
   }
 
-  const params = req.body && typeof req.body === "object" ? req.body : {};
-  const messageJson = JSON.stringify(params ?? {});
-  const messageB64Url = b64url(Buffer.from(messageJson, "utf8"));
-  const signatureB64Url = signMessageBase64Url(messageB64Url);
+  const region = "eu";
+  const wsUrl = `wss://fleet-gateway.prd.${region}.vn.cloud.tesla.com/v1`;
 
-  // ✅ Correct Tesla Fleet Gateway WebSocket endpoint
-  const wsUrl = `wss://fleet-vehicle-command.prd.${TESLA_REGION}.vn.cloud.tesla.com/v1`;
+  try {
+    const handshake = {
+      type: "VehicleCommandHandshake",
+      token: token,
+      domain: domain,
+    };
 
-  // Prepare handshake and command payloads
-  const handshake = {
-    type: "VehicleCommandHandshake",
-    domain: TESLA_DOMAIN,
-  };
+    const message = JSON.stringify(params || {});
+    const sign = crypto.createSign("SHA256");
+    sign.update(message);
+    sign.end();
 
-  const requestMsg = {
-    type: "VehicleCommandRequest",
-    command,
-    vehicle_id: vehicleId,
-    message: messageB64Url,
-    signature: signatureB64Url,
-  };
+    const key = crypto.createPrivateKey(privateKeyPem);
+    const signature = sign.sign(key).toString("base64");
 
-  let settled = false;
-  const timeoutMs = 15000;
-  const timer = setTimeout(() => {
-    if (!settled) {
-      settled = true;
-      try { ws.close(); } catch (_) {}
-      res.status(504).json({ ok: false, error: "VCP timeout" });
-    }
-  }, timeoutMs);
+    const commandMsg = {
+      type: "VehicleCommandRequest",
+      command,
+      vehicle_id: vehicleId,
+      params,
+      signature,
+    };
 
-  const ws = new WebSocket(wsUrl, { headers: { Authorization: auth } });
+    const ws = new WebSocket(wsUrl, {
+      headers: { Authorization: `Bearer ${token}` },
+    });
 
-  ws.on("open", () => {
-    try {
+    ws.on("open", () => {
       ws.send(JSON.stringify(handshake));
-      setTimeout(() => ws.send(JSON.stringify(requestMsg)), 150);
-    } catch (e) {
-      if (!settled) {
-        settled = true;
-        clearTimeout(timer);
-        res.status(500).json({ ok: false, error: "Handshake/Send failed", details: String(e) });
-      }
-    }
-  });
+      setTimeout(() => ws.send(JSON.stringify(commandMsg)), 300);
+    });
 
-  ws.on("message", (data) => {
-    try {
-      const msg = JSON.parse(data.toString());
-      if (msg.type === "VehicleCommandResponse" || msg.result !== undefined) {
-        if (!settled) {
-          settled = true;
-          clearTimeout(timer);
-          res.status(200).json({ ok: true, txid: msg.txid, response: msg });
+    ws.on("message", (data) => {
+      try {
+        const msg = JSON.parse(data.toString());
+        if (msg.type === "VehicleCommandResponse") {
+          res.json(msg);
           ws.close();
         }
+      } catch (err) {
+        console.error("Invalid JSON:", data.toString());
       }
-    } catch (e) {
-      // ignore non-JSON frames
-    }
-  });
+    });
 
-  ws.on("error", (err) => {
-    if (!settled) {
-      settled = true;
-      clearTimeout(timer);
-      res.status(502).json({ ok: false, error: "WebSocket error", details: String(err?.message || err) });
-    }
-  });
-
-  ws.on("close", () => {
-    if (!settled) {
-      settled = true;
-      clearTimeout(timer);
-      res.status(502).json({ ok: false, error: "WebSocket closed before response" });
-    }
-  });
+    ws.on("error", (err) => {
+      console.error("WebSocket error:", err);
+      res.status(500).json({ error: err.message });
+    });
+  } catch (err) {
+    console.error("Proxy error:", err);
+    res.status(500).json({ error: err.message });
+  }
 });
 
-const port = process.env.PORT || 8080;
-app.listen(port, () => {
-  console.log(`🚗 Tesla VCP proxy listening on port ${port} (region=${TESLA_REGION}, domain=${TESLA_DOMAIN})`);
+app.get("/", (req, res) => {
+  res.send("✅ Tesla VCP Proxy running");
 });
+
+const port = process.env.PORT || 8787;
+app.listen(port, () => console.log(`🚀 Proxy ready on port ${port}`));
