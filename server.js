@@ -5,43 +5,39 @@ import crypto from "crypto";
 const app = express();
 app.use(express.json());
 
-// --- REGION asetetaan ympäristömuuttujasta tai oletuksena EU ---
+// Read region from environment or use EU by default
 const REGION = process.env.TESLA_REGION || "eu";
 
-// --- Tesla Fleet Gatewayn uusi osoite (2025-07-21 jälkeen) ---
+// New Fleet API gateway according to 2025 guidelines
 const FLEET_GATEWAY_URL = `wss://fleet-api.prd.${REGION}.vn.cloud.tesla.com/v1`;
-
-// --- Tesla token endpoint diagnostiikkaa varten ---
-const FLEET_AUTH_URL = `https://fleet-auth.prd.vn.cloud.tesla.com/oauth2/v3/token`;
 
 app.post("/command/:vehicleId/:command", async (req, res) => {
   const { vehicleId, command } = req.params;
   const { token, params, privateKeyPem, domain } = req.body;
 
   if (!token || !privateKeyPem || !domain) {
-    return res.status(400).json({ error: "Missing required fields (token/privateKeyPem/domain)" });
+    return res
+      .status(400)
+      .json({ error: "Missing required fields (token, privateKeyPem, domain)" });
   }
 
-  console.log(`🔌 Incoming command: ${command} for vehicle ${vehicleId}`);
-
   try {
-    // 1️⃣ Alustetaan handshake Tesla Fleet Gatewaylle
+    // Handshake message
     const handshake = {
       type: "VehicleCommandHandshake",
       token,
       domain,
     };
 
-    // 2️⃣ Allekirjoitetaan komento yksityisellä avaimella (ECDSA)
+    // Sign the command parameters
     const message = JSON.stringify(params || {});
-    const sign = crypto.createSign("SHA256");
-    sign.update(message);
-    sign.end();
-
+    const signer = crypto.createSign("SHA256");
+    signer.update(message);
+    signer.end();
     const key = crypto.createPrivateKey(privateKeyPem);
-    const signature = sign.sign(key).toString("base64");
+    const signature = signer.sign(key).toString("base64");
 
-    // 3️⃣ Rakennetaan varsinainen komento
+    // Compose the command message
     const commandMsg = {
       type: "VehicleCommandRequest",
       command,
@@ -50,15 +46,12 @@ app.post("/command/:vehicleId/:command", async (req, res) => {
       signature,
     };
 
-    // 4️⃣ Luodaan WebSocket-yhteys Fleet API Gatewayhin
     const ws = new WebSocket(FLEET_GATEWAY_URL, {
       headers: { Authorization: `Bearer ${token}` },
     });
 
     let responded = false;
-
     ws.on("open", () => {
-      console.log("✅ WebSocket connected to Tesla Fleet Gateway");
       ws.send(JSON.stringify(handshake));
       setTimeout(() => ws.send(JSON.stringify(commandMsg)), 400);
     });
@@ -66,8 +59,6 @@ app.post("/command/:vehicleId/:command", async (req, res) => {
     ws.on("message", (data) => {
       try {
         const msg = JSON.parse(data.toString());
-        console.log("📩 Received:", msg);
-
         if (msg.type === "VehicleCommandResponse" && !responded) {
           responded = true;
           res.json(msg);
@@ -78,6 +69,22 @@ app.post("/command/:vehicleId/:command", async (req, res) => {
       }
     });
 
-    ws.on("close", () => {
-      console.log("🔌 WebSocket closed");
-    })
+    ws.on("error", (err) => {
+      if (!responded) {
+        res.status(500).json({ error: err.message });
+      }
+    });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Health check endpoint
+app.get("/", (_req, res) => {
+  res.send("✅ Tesla VCP Proxy (Fleet API v2025) running");
+});
+
+const port = process.env.PORT || 8787;
+app.listen(port, () =>
+  console.log(`🚀 Tesla VCP Proxy ready on port ${port} | Region: ${REGION}`)
+);
