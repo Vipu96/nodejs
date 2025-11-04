@@ -1,132 +1,89 @@
+/**
+ * Tesla Business Proxy (Third-party for Business / M2M)
+ * ----------------------------------------------------
+ * Render-palvelin, joka vastaanottaa Cloudflarelta komennot
+ * ja välittää ne Tesla Fleet API:lle (HTTPS, ei WebSocket).
+ */
+
 import express from "express";
-import WebSocket from "ws";
-import crypto from "crypto";
 
 const app = express();
 app.use(express.json());
 
-// Asetukset (voit tarvittaessa siirtää nämä Renderin ympäristömuuttujiin)
+// 🌍 Tesla API -asetukset
 const REGION = process.env.TESLA_REGION || "eu";
-const FLEET_GATEWAY_URL = `wss://fleet-api.prd.${REGION}.vn.cloud.tesla.com/v1`;
+const FLEET_API_BASE = `https://fleet-api.prd.${REGION}.tesla.com`;
 
-// Debug-loki (Renderin logeihin)
+// 🧠 Pieni log-funktio Renderin logeihin
 function log(...args) {
-  console.log("[TeslaProxy]", ...args);
+  console.log("[TeslaBusinessProxy]", ...args);
 }
 
 /**
  * POST /command/:vehicleId/:command
- * Lähettää komennon Teslan Fleet Gatewayhin
+ * Lähettää REST-komennon Tesla Fleet API:lle
  */
 app.post("/command/:vehicleId/:command", async (req, res) => {
   const { vehicleId, command } = req.params;
-  const { token, params, privateKeyPem, domain } = req.body;
+  const { token, params } = req.body;
 
-  if (!token || !privateKeyPem || !domain) {
+  if (!token) {
     return res.status(400).json({
-      error: "Missing required fields (token, privateKeyPem, domain)",
+      error: "Missing token (business_token required in request body)",
     });
   }
 
   try {
-    // Luo allekirjoitus viestille
-    const message = JSON.stringify(params || {});
-    const signer = crypto.createSign("SHA256");
-    signer.update(message);
-    signer.end();
-    const key = crypto.createPrivateKey(privateKeyPem);
-    const signature = signer.sign(key).toString("base64");
+    const url = `${FLEET_API_BASE}/api/1/vehicles/${vehicleId}/command/${command}`;
+    log("→ Sending command to Tesla:", url);
 
-    // Luo WebSocket-yhteys Tesla Fleet Gatewayhin
-    const ws = new WebSocket(FLEET_GATEWAY_URL, {
-      headers: { Authorization: `Bearer ${token}` },
+    const response = await fetch(url, {
+      method: "POST",
+      headers: {
+        "Authorization": `Bearer ${token}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify(params || {}),
     });
 
-    let responded = false;
-    const timeout = setTimeout(() => {
-      if (!responded) {
-        responded = true;
-        res.status(504).json({ error: "Timeout waiting for Tesla response" });
-        ws.close();
-      }
-    }, 10000);
+    const data = await response.json();
 
-    ws.on("open", () => {
-      log("Connected to Tesla Fleet Gateway");
+    if (!response.ok) {
+      log("❌ Tesla Fleet API error:", response.status, data);
+      return res.status(response.status).json({
+        error: data.error || data.message || "Tesla API error",
+        details: data,
+      });
+    }
 
-      // 1️⃣ Lähetä handshake
-      ws.send(JSON.stringify({
-        type: "VehicleCommandHandshake",
-        token,
-        domain,
-      }));
-
-      // 2️⃣ Lähetä komento
-      setTimeout(() => {
-        ws.send(JSON.stringify({
-          type: "VehicleCommandRequest",
-          command,
-          vehicle_id: vehicleId,
-          params,
-          signature,
-        }));
-      }, 400);
+    log("✅ Tesla command successful:", command);
+    res.json({
+      success: true,
+      command,
+      vehicleId,
+      response: data,
     });
-
-    ws.on("message", (data) => {
-      try {
-        const msg = JSON.parse(data.toString());
-        if (msg.type === "VehicleCommandResponse" && !responded) {
-          responded = true;
-          clearTimeout(timeout);
-          log("Received VehicleCommandResponse");
-          res.json(msg);
-          ws.close();
-        } else if (msg.type === "Error") {
-          responded = true;
-          clearTimeout(timeout);
-          res.status(403).json({ error: msg.error || "Forbidden" });
-          ws.close();
-        }
-      } catch (err) {
-        responded = true;
-        clearTimeout(timeout);
-        log("Error parsing Tesla response:", err);
-        res.status(500).json({ error: "Invalid response from Tesla" });
-      }
-    });
-
-    ws.on("error", (err) => {
-      responded = true;
-      clearTimeout(timeout);
-      log("WebSocket error:", err.message);
-      if (err.message.includes("403")) {
-        res.status(403).json({
-          error:
-            "Tesla returned 403 – check Virtual Key pairing and token validity.",
-        });
-      } else if (err.message.includes("ENOTFOUND")) {
-        res.status(502).json({
-          error:
-            "Fleet Gateway hostname not reachable – Tesla endpoint requires partner access.",
-        });
-      } else {
-        res.status(500).json({ error: err.message });
-      }
-    });
-
-    ws.on("close", () => log("Tesla Fleet Gateway connection closed"));
   } catch (err) {
-    log("Server error:", err);
+    log("⚠️ Server error:", err);
     res.status(500).json({ error: err.message });
   }
 });
 
-// Health check
+/**
+ * Health check endpoint
+ */
 app.get("/", (_, res) => {
-  res.json({ ok: true, service: "Tesla Render Proxy", region: REGION });
+  res.json({
+    ok: true,
+    service: "Tesla Render Proxy (Third-party for Business)",
+    region: REGION,
+    usage: {
+      method: "POST /command/:vehicleId/:command",
+      headers: { Authorization: "Bearer <business_token>" },
+    },
+  });
 });
 
-// Render/Node kuuntelee porttia
+// 🚀 Käynnistetään palvelin
 const PORT = process.env.PORT || 10000;
 app.listen(PORT, () => log(`Server running on port ${PORT}`));
