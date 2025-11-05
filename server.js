@@ -140,7 +140,7 @@ app.all("/info", async (req, res) => {
 app.post("/command/:vehicleId/:command", async (req, res) => {
   const token = extractAccessToken(req);
   const rawVehicleId = req.params.vehicleId;
-  the command = req.params.command;
+  const command = req.params.command;
   const params = extractCommandParams(req.body);
 
   log(`➡️ Command received: /command/${rawVehicleId}/${command}`);
@@ -158,7 +158,8 @@ app.post("/command/:vehicleId/:command", async (req, res) => {
       return res.status(404).json({
         error: "Vehicle not found",
         details: {
-          message: "VIN tai ajoneuvo-ID ei löytynyt Tesla Fleet API:n kautta. Varmista, että ajoneuvo on jaettu sovellukselle ja että tokenilla on oikeudet.",
+          message:
+            "VIN tai ajoneuvo-ID ei löytynyt Tesla Fleet API:n kautta. Varmista, että ajoneuvo on jaettu sovellukselle ja että tokenilla on oikeudet.",
           provided: rawVehicleId,
         },
       });
@@ -260,7 +261,7 @@ async function sendVehicleCommand(options) {
       Authorization: `Bearer ${token}`,
       "Content-Type": "application/json",
     },
-    body: JSON.stringify(params),
+    body: JSON.stringify(params || {}),
   });
 
   const parsedLegacy = await parseJsonResponse(legacyResponse);
