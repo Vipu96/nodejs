@@ -7,6 +7,7 @@
  */
 
 import express from "express";
+import { randomUUID } from "crypto";
 
 const app = express();
 app.use(express.json());
@@ -40,6 +41,29 @@ function extractAccessToken(req) {
   }
 
   return null;
+}
+
+function extractCommandParams(body) {
+  if (!body || typeof body !== "object") {
+    return {};
+  }
+
+  if (body.params && typeof body.params === "object") {
+    return body.params;
+  }
+
+  const params = {};
+  for (const key in body) {
+    if (!Object.prototype.hasOwnProperty.call(body, key)) {
+      continue;
+    }
+    if (key === "token") {
+      continue;
+    }
+    params[key] = body[key];
+  }
+
+  return params;
 }
 
 async function parseJsonResponse(response) {
@@ -116,8 +140,8 @@ app.all("/info", async (req, res) => {
 app.post("/command/:vehicleId/:command", async (req, res) => {
   const token = extractAccessToken(req);
   const rawVehicleId = req.params.vehicleId;
-  const command = req.params.command;
-  const params = req.body && typeof req.body === "object" ? req.body.params || {} : {};
+  the command = req.params.command;
+  const params = extractCommandParams(req.body);
 
   log(`➡️ Command received: /command/${rawVehicleId}/${command}`);
 
@@ -140,54 +164,170 @@ app.post("/command/:vehicleId/:command", async (req, res) => {
       });
     }
 
-    const url = `${FLEET_API_BASE}/api/1/vehicles/${vehicleId}/command/${command}`;
-    log("→ Forwarding command to Tesla:", url);
-
-    const response = await fetch(url, {
-      method: "POST",
-      headers: {
-        Authorization: `Bearer ${token}`,
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify(params || {}),
+    const result = await sendVehicleCommand({
+      vehicleId,
+      command,
+      params,
+      token,
     });
 
-    const parsed = await parseJsonResponse(response);
-    const body = parsed.data || {};
-
-    const hasBody = body && typeof body === "object" && Object.keys(body).length > 0;
-
-    if (!response.ok) {
-      log("❌ Tesla Fleet API command error:", response.status, parsed.raw);
-      const errorPayload = {
-        error: body.error || body.message || "Tesla API HTTP error",
-      };
-      if (hasBody) {
-        errorPayload.details = body;
-      } else if (parsed.raw) {
-        errorPayload.details = parsed.raw;
-      }
-      return res.status(response.status).json(errorPayload);
-    }
-
-    const commandResult = body && body.response ? body.response.result === true : false;
-    if (commandResult) {
-      log("✅ Tesla command succeeded:", command);
-    } else {
-      log("⚠️ Tesla command responded with result=false:", parsed.raw);
+    if (!result.ok) {
+      return res.status(result.status).json(result.errorPayload);
     }
 
     return res.json({
-      success: commandResult,
+      success: result.success,
       command,
       vehicleId,
-      response: body,
+      response: result.body,
     });
   } catch (err) {
     log("⚠️ Server error on command:", err);
     return res.status(500).json({ error: err.message });
   }
 });
+
+async function sendVehicleCommand(options) {
+  const vehicleId = options.vehicleId;
+  const command = options.command;
+  const params = options.params || {};
+  const token = options.token;
+
+  const requestId = typeof randomUUID === "function"
+    ? randomUUID()
+    : `cmd-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+
+  const vcpUrl = `${FLEET_API_BASE}/api/1/vehicles/${vehicleId}/commands`;
+  const payload = {
+    command,
+    parameters: params,
+  };
+
+  log("→ Forwarding command via VCP:", vcpUrl, "payload:", JSON.stringify(payload));
+
+  const vcpResponse = await fetch(vcpUrl, {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${token}`,
+      "Content-Type": "application/json",
+      "X-Tesla-Request-Id": requestId,
+    },
+    body: JSON.stringify(payload),
+  });
+
+  const parsedVcp = await parseJsonResponse(vcpResponse);
+  const vcpBody = parsedVcp.data || {};
+
+  if (!vcpResponse.ok && vcpResponse.status !== 404) {
+    log("❌ Tesla VCP command error:", vcpResponse.status, parsedVcp.raw);
+    const errorPayload = {
+      error: vcpBody.error || vcpBody.message || "Tesla API HTTP error",
+    };
+    if (vcpBody && typeof vcpBody === "object" && Object.keys(vcpBody).length > 0) {
+      errorPayload.details = vcpBody;
+    } else if (parsedVcp.raw) {
+      errorPayload.details = parsedVcp.raw;
+    }
+    return {
+      ok: false,
+      status: vcpResponse.status,
+      errorPayload,
+    };
+  }
+
+  if (vcpResponse.ok) {
+    const success = interpretCommandSuccess(vcpBody);
+    if (success) {
+      log("✅ Tesla command accepted via VCP:", command, "requestId:", requestId);
+    } else {
+      log("⚠️ Tesla command VCP response did not signal success explicitly:", parsedVcp.raw);
+    }
+    return {
+      ok: true,
+      status: vcpResponse.status,
+      success,
+      body: vcpBody,
+    };
+  }
+
+  // VCP endpoint returned 404; fall back to legacy REST command route for backwards compatibility.
+  const legacyUrl = `${FLEET_API_BASE}/api/1/vehicles/${vehicleId}/command/${command}`;
+  log("ℹ️ VCP endpoint returned 404, falling back to legacy command endpoint:", legacyUrl);
+
+  const legacyResponse = await fetch(legacyUrl, {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${token}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify(params),
+  });
+
+  const parsedLegacy = await parseJsonResponse(legacyResponse);
+  const legacyBody = parsedLegacy.data || {};
+
+  if (!legacyResponse.ok) {
+    log("❌ Tesla legacy command error:", legacyResponse.status, parsedLegacy.raw);
+    const errorPayload = {
+      error: legacyBody.error || legacyBody.message || "Tesla API HTTP error",
+    };
+    if (legacyBody && typeof legacyBody === "object" && Object.keys(legacyBody).length > 0) {
+      errorPayload.details = legacyBody;
+    } else if (parsedLegacy.raw) {
+      errorPayload.details = parsedLegacy.raw;
+    }
+    return {
+      ok: false,
+      status: legacyResponse.status,
+      errorPayload,
+    };
+  }
+
+  const success = interpretCommandSuccess(legacyBody);
+  if (success) {
+    log("✅ Tesla command succeeded via legacy endpoint:", command);
+  } else {
+    log("⚠️ Tesla legacy command response did not signal success explicitly:", parsedLegacy.raw);
+  }
+
+  return {
+    ok: true,
+    status: legacyResponse.status,
+    success,
+    body: legacyBody,
+  };
+}
+
+function interpretCommandSuccess(body) {
+  if (!body || typeof body !== "object") {
+    return false;
+  }
+
+  const payload = typeof body.response === "object" && body.response !== null
+    ? body.response
+    : body;
+
+  if (payload.result === true) {
+    return true;
+  }
+
+  const statusFields = [payload.status, payload.state, payload.command_status];
+  for (let i = 0; i < statusFields.length; i += 1) {
+    const value = statusFields[i];
+    if (typeof value === "string") {
+      const normalized = value.toLowerCase();
+      if (normalized === "accepted" || normalized === "queued" || normalized === "pending" || normalized === "in_progress" || normalized === "sent" || normalized === "success" || normalized === "succeeded" || normalized === "completed" || normalized === "done") {
+        return true;
+      }
+    }
+  }
+
+  if (payload.command_id || payload.id) {
+    return true;
+  }
+
+  return false;
+}
 
 /**
  * Muuntaa VIN-koodin numeeriseksi ajoneuvo-ID:ksi. Jos syöte on jo numeerinen,
