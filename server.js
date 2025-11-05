@@ -3,7 +3,7 @@
  * ----------------------------------------------------
  * Render-palvelin, joka vastaanottaa Cloudflarelta komennot
  * ja välittää ne Tesla Fleet API:lle (HTTPS, ei WebSocket).
- * * HUOM: Tämä versio sisältää /info-reitin ajoneuvotunnuksen tarkistamiseksi.
+ * * HUOM: Tämä versio käyttää app.all() tukeakseen tokenin välitystä bodyssä /info-reitille.
  */
 
 import express from "express";
@@ -24,16 +24,13 @@ function log(...args) {
 
 /**
  * --- TÄRKEÄ TESTIREITTI ---
- * GET /info
+ * GET/POST /info
  * -----------------------------
  * Käytetään ajoneuvolistausten hakuun ja M2M-tunnuksen kelpoisuuden tarkistamiseen.
  * Ottaa M2M business_tokenin suoraan request body:sta (token-kenttä).
  */
-app.get("/info", async (req, res) => {
+app.all("/info", async (req, res) => { // Käytetään app.all() hyväksymään GET JA POST
   // Odotetaan business_tokenia request body:sta.
-  // Huom: GET-pyynnöt eivät yleensä käytä bodya, mutta tässä tapauksessa
-  // Cloudflare Worker välittää tunnuksen POST-komennon bodyssä. Jos testailet
-  // tätä suoraan selaimeen, sinun on käytettävä POST-pyyntöä ja sisällytettävä token.
   const { token } = req.body; 
 
   if (!token) {
@@ -49,7 +46,7 @@ app.get("/info", async (req, res) => {
     log("→ Sending GET request for vehicle list to Tesla:", url);
 
     const response = await fetch(url, {
-      method: "GET",
+      method: "GET", // Tesla API:lle itse kutsu on GET
       headers: {
         "Authorization": `Bearer ${token}`,
       },
@@ -156,7 +153,7 @@ app.get("/", (_, res) => {
     usage: {
       method: "POST /command/:vehicleId/:command",
       body: "{ token: '<business_token>', params: { /* command body */ } }",
-      info: "GET /info (vaatii tokenin bodyssä, suositellaan käyttämään Cloudflare Workerin /api/proxy/info -reittiä)",
+      info: "GET/POST /info (käytä Cloudflare Workerin /api/proxy/info -reittiä)",
     },
   });
 });
