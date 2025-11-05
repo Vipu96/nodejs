@@ -31,6 +31,8 @@ app.post("/command/:vehicleId/:command", async (req, res) => {
   // Odotetaan business_tokenia ja komennon parametreja bodysta
   const { token, params } = req.body;
 
+  log(`➡️ Vastaanotettu komento Renderissä: /command/${vehicleId}/${command}`); // LOKITUS RENDER-PUOLELLA
+
   if (!token) {
     return res.status(400).json({
       error: "Missing token (M2M business_token required in request body)",
