@@ -3,6 +3,7 @@
  * ----------------------------------------------------
  * Render-palvelin, joka vastaanottaa Cloudflarelta komennot
  * ja välittää ne Tesla Fleet API:lle (HTTPS, ei WebSocket).
+ * * HUOM: Tämä versio sisältää /info-reitin ajoneuvotunnuksen tarkistamiseksi.
  */
 
 import express from "express";
@@ -20,6 +21,62 @@ const FLEET_API_BASE = `https://fleet-api.prd.${REGION}.vn.cloud.tesla.com`;
 function log(...args) {
   console.log("[TeslaBusinessProxy]", ...args);
 }
+
+/**
+ * --- TÄRKEÄ TESTIREITTI ---
+ * GET /info
+ * -----------------------------
+ * Käytetään ajoneuvolistausten hakuun ja M2M-tunnuksen kelpoisuuden tarkistamiseen.
+ * Ottaa M2M business_tokenin suoraan request body:sta (token-kenttä).
+ */
+app.get("/info", async (req, res) => {
+  // Odotetaan business_tokenia request body:sta.
+  // Huom: GET-pyynnöt eivät yleensä käytä bodya, mutta tässä tapauksessa
+  // Cloudflare Worker välittää tunnuksen POST-komennon bodyssä. Jos testailet
+  // tätä suoraan selaimeen, sinun on käytettävä POST-pyyntöä ja sisällytettävä token.
+  const { token } = req.body; 
+
+  if (!token) {
+     return res.status(400).json({
+       error: "Missing token (M2M business_token required in request body)",
+       details: "Käytä Cloudflare Workerin /api/proxy/info -reittiä, joka lisää tokenin automaattisesti."
+     });
+   }
+  
+  try {
+    // API kutsu ajoneuvolistaan
+    const url = `${FLEET_API_BASE}/api/1/vehicles`;
+    log("→ Sending GET request for vehicle list to Tesla:", url);
+
+    const response = await fetch(url, {
+      method: "GET",
+      headers: {
+        "Authorization": `Bearer ${token}`,
+      },
+    });
+
+    const data = await response.json();
+
+    if (!response.ok) {
+      log("❌ Tesla Fleet API error on /vehicles:", response.status, data);
+      return res.status(response.status).json({
+        error: data.error || data.message || "Tesla API HTTP error on /vehicles",
+        details: data,
+      });
+    }
+
+    log("✅ Vehicle list successful. Found:", data.response.length, "vehicles.");
+    res.json({
+      success: true,
+      response: data.response,
+      // TÄRKEÄ: Jokaisella ajoneuvolla pitäisi olla numeerinen "id" jota käytetään /command-reitissä
+    });
+  } catch (err) {
+    log("⚠️ Server error on /info:", err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
 
 /**
  * POST /command/:vehicleId/:command
@@ -40,6 +97,7 @@ app.post("/command/:vehicleId/:command", async (req, res) => {
   }
 
   try {
+    // Käytä numeerista vehicleId:tä
     const url = `${FLEET_API_BASE}/api/1/vehicles/${vehicleId}/command/${command}`;
     log("→ Sending command to Tesla:", url);
 
@@ -54,8 +112,6 @@ app.post("/command/:vehicleId/:command", async (req, res) => {
       body: JSON.stringify(params || {}),
     });
 
-    // Tesla API palauttaa usein 200 OK, vaikka komento ei onnistuisi heti.
-    // Varsinainen tulos on `response.response` kentässä.
     const data = await response.json();
 
     if (!response.ok) {
@@ -67,7 +123,6 @@ app.post("/command/:vehicleId/:command", async (req, res) => {
       });
     }
     
-    // Tarkista varsinainen komennon onnistuminen (riippuu komennosta, mutta tämä on hyvä yleistarkistus)
     const commandSuccess = data.response?.result === true;
     
     if (commandSuccess) {
@@ -101,6 +156,7 @@ app.get("/", (_, res) => {
     usage: {
       method: "POST /command/:vehicleId/:command",
       body: "{ token: '<business_token>', params: { /* command body */ } }",
+      info: "GET /info (vaatii tokenin bodyssä, suositellaan käyttämään Cloudflare Workerin /api/proxy/info -reittiä)",
     },
   });
 });
