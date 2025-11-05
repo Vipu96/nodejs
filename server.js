@@ -11,8 +11,10 @@ const app = express();
 app.use(express.json());
 
 // 🌍 Tesla API -asetukset
+// EU-alueelle Fleet API:n perusosoite on: https://fleet-api.prd.eu.vn.cloud.tesla.com
 const REGION = process.env.TESLA_REGION || "eu";
-const FLEET_API_BASE = `https://fleet-api.prd.${REGION}.tesla.com`;
+// KORJAUS: Lisätty .vn.cloud osoitteeseen DNS-resoluutio-ongelmien korjaamiseksi.
+const FLEET_API_BASE = `https://fleet-api.prd.${REGION}.vn.cloud.tesla.com`;
 
 // 🧠 Pieni log-funktio Renderin logeihin
 function log(...args) {
@@ -22,14 +24,16 @@ function log(...args) {
 /**
  * POST /command/:vehicleId/:command
  * Lähettää REST-komennon Tesla Fleet API:lle
+ * HUOM: Odottaa M2M business_tokenia request body:ssa (token-kenttä)
  */
 app.post("/command/:vehicleId/:command", async (req, res) => {
   const { vehicleId, command } = req.params;
+  // Odotetaan business_tokenia ja komennon parametreja bodysta
   const { token, params } = req.body;
 
   if (!token) {
     return res.status(400).json({
-      error: "Missing token (business_token required in request body)",
+      error: "Missing token (M2M business_token required in request body)",
     });
   }
 
@@ -40,25 +44,40 @@ app.post("/command/:vehicleId/:command", async (req, res) => {
     const response = await fetch(url, {
       method: "POST",
       headers: {
+        // Tunnus otetaan bodysta ja välitetään Authorization-headerissa
         "Authorization": `Bearer ${token}`,
         "Content-Type": "application/json",
       },
+      // Komennot Teslalle ovat aina POST-pyyntöjä, joilla on usein tyhjä tai täytetty body.
       body: JSON.stringify(params || {}),
     });
 
+    // Tesla API palauttaa usein 200 OK, vaikka komento ei onnistuisi heti.
+    // Varsinainen tulos on `response.response` kentässä.
     const data = await response.json();
 
     if (!response.ok) {
+      // Tämä käsittelee HTTP-virheet (esim. 401, 403, 404, 5xx)
       log("❌ Tesla Fleet API error:", response.status, data);
       return res.status(response.status).json({
-        error: data.error || data.message || "Tesla API error",
+        error: data.error || data.message || "Tesla API HTTP error",
         details: data,
       });
     }
+    
+    // Tarkista varsinainen komennon onnistuminen (riippuu komennosta, mutta tämä on hyvä yleistarkistus)
+    const commandSuccess = data.response?.result === true;
+    
+    if (commandSuccess) {
+        log("✅ Tesla command successful:", command);
+    } else {
+         // Jos HTTP-status on 200, mutta komennon tulos on epäonnistunut
+        log("⚠️ Tesla command result failed (HTTP 200 but result: false):", command, data);
+    }
 
-    log("✅ Tesla command successful:", command);
+
     res.json({
-      success: true,
+      success: commandSuccess,
       command,
       vehicleId,
       response: data,
@@ -79,7 +98,7 @@ app.get("/", (_, res) => {
     region: REGION,
     usage: {
       method: "POST /command/:vehicleId/:command",
-      headers: { Authorization: "Bearer <business_token>" },
+      body: "{ token: '<business_token>', params: { /* command body */ } }",
     },
   });
 });
