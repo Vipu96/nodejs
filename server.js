@@ -81,11 +81,11 @@ app.all("/info", async (req, res) => { // Käytetään app.all() hyväksymään 
  * HUOM: Odottaa M2M business_tokenia request body:ssa (token-kenttä)
  */
 app.post("/command/:vehicleId/:command", async (req, res) => {
-  const { vehicleId, command } = req.params;
+  const { vehicleId: rawVehicleId, command } = req.params;
   // Odotetaan business_tokenia ja komennon parametreja bodysta
   const { token, params } = req.body;
 
-  log(`➡️ Vastaanotettu komento Renderissä: /command/${vehicleId}/${command}`); // LOKITUS RENDER-PUOLELLA
+  log(`➡️ Vastaanotettu komento Renderissä: /command/${rawVehicleId}/${command}`); // LOKITUS RENDER-PUOLELLA
 
   if (!token) {
     return res.status(400).json({
@@ -94,7 +94,20 @@ app.post("/command/:vehicleId/:command", async (req, res) => {
   }
 
   try {
-    // Käytä numeerista vehicleId:tä
+    // Selvitetään numeerinen ajoneuvo-ID. Jos polussa oleva ID näyttää VIN-koodilta,
+    // haetaan vastaava numeerinen id erillisellä /vehicles -pyynnöllä.
+    const vehicleId = await resolveVehicleId(rawVehicleId, token);
+    if (!vehicleId) {
+      return res.status(404).json({
+        error: "Vehicle not found",
+        details: {
+          message:
+            "VIN tai ajoneuvo-ID ei löytynyt Tesla Fleet API:n kautta. Varmista, että ajoneuvo on jaettu sovellukselle.",
+          provided: rawVehicleId,
+        },
+      });
+    }
+
     const url = `${FLEET_API_BASE}/api/1/vehicles/${vehicleId}/command/${command}`;
     log("→ Sending command to Tesla:", url);
 
@@ -141,6 +154,54 @@ app.post("/command/:vehicleId/:command", async (req, res) => {
     res.status(500).json({ error: err.message });
   }
 });
+
+/**
+ * Muuntaa VIN-koodin numeeriseksi ajoneuvo-ID:ksi. Jos syöte on jo numeerinen,
+ * palautetaan se sellaisenaan. Muussa tapauksessa haetaan /vehicles -listaus
+ * ja etsitään vastaava VIN-koodi.
+ */
+async function resolveVehicleId(vehicleIdentifier, token) {
+  if (/^\d+$/.test(vehicleIdentifier)) {
+    return vehicleIdentifier;
+  }
+
+  const vin = String(vehicleIdentifier).trim().toUpperCase();
+  if (!vin) {
+    return null;
+  }
+
+  const url = `${FLEET_API_BASE}/api/1/vehicles`;
+  log("🔍 Resolving VIN to vehicle id via:", url);
+
+  const response = await fetch(url, {
+    method: "GET",
+    headers: {
+      Authorization: `Bearer ${token}`,
+    },
+  });
+
+  if (!response.ok) {
+    const errorBody = await response.text();
+    log("❌ VIN resolution failed:", response.status, errorBody);
+    return null;
+  }
+
+  const data = await response.json();
+  const vehicles = data?.response || [];
+  const match = vehicles.find((vehicle) => {
+    if (!vehicle) return false;
+    const vehicleVin = String(vehicle.vin || "").toUpperCase();
+    return vehicleVin === vin;
+  });
+
+  if (match?.id) {
+    log(`✅ VIN ${vin} resolved to vehicle id ${match.id}`);
+    return match.id;
+  }
+
+  log(`⚠️ VIN ${vin} not found in vehicle list.`);
+  return null;
+}
 
 /**
  * Health check endpoint
