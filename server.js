@@ -95,8 +95,14 @@ function buildFleetCommandBaseList() {
     bases.push(override);
   }
 
+  // Always try the configured Fleet API base as the first fallback since some
+  // regions expose the Vehicle Command Protocol on the data host itself.
+  bases.push(FLEET_API_BASE);
+
+  // Known Tesla-hosted Fleet Command domains (region-scoped and global).
   bases.push(`https://fleet-command.prd.${REGION}.vn.cloud.tesla.com`);
   bases.push("https://fleet-command.prd.vn.cloud.tesla.com");
+  bases.push("https://fleet-command.vn.cloud.tesla.com");
 
   if (REGION !== "na") {
     bases.push("https://fleet-command.prd.na.vn.cloud.tesla.com");
@@ -105,17 +111,23 @@ function buildFleetCommandBaseList() {
     bases.push("https://fleet-command.prd.eu.vn.cloud.tesla.com");
   }
 
+  // Allow override hosts without scheme (e.g. fleet-command.prd.eu.vn.cloud.tesla.com)
+  // by normalising below.
+
   const normalized = [];
   for (let i = 0; i < bases.length; i += 1) {
     const candidate = (bases[i] || "").trim();
     if (!candidate) {
       continue;
     }
-    const cleaned = candidate.replace(/\/+$/, "");
+    const prefixed = candidate.indexOf("http") === 0 ? candidate : `https://${candidate}`;
+    const cleaned = prefixed.replace(/\/+$/, "");
     if (normalized.indexOf(cleaned) === -1) {
       normalized.push(cleaned);
     }
   }
+
+  console.log("[TeslaThirdPartyProxy] Fleet command base candidates:", normalized.join(", "));
 
   return normalized;
 }
@@ -344,6 +356,9 @@ async function sendVehicleCommand(options) {
         } else if (parsedVcp.raw) {
           errorPayload.details = parsedVcp.raw;
         }
+        if (vcpAttempts.length > 0) {
+          errorPayload.hint = "Verify the Vehicle Command Protocol endpoint (TESLA_COMMAND_BASES) matches the host documented at https://github.com/teslamotors/vehicle-command.";
+        }
         attachVcpAttempts(errorPayload, vcpAttempts);
         return {
           ok: false,
@@ -406,6 +421,9 @@ async function sendVehicleCommand(options) {
       errorPayload.details = legacyBody;
     } else if (parsedLegacy.raw) {
       errorPayload.details = parsedLegacy.raw;
+    }
+    if (vcpAttempts.length > 0) {
+      errorPayload.hint = "Vehicle Command Protocol host unreachable or rejected. Set TESLA_COMMAND_BASES to the documented command endpoint from https://github.com/teslamotors/vehicle-command.";
     }
     attachVcpAttempts(errorPayload, vcpAttempts);
     return {
