@@ -16,7 +16,7 @@ app.use(express.json());
 // EU-alueelle Fleet API:n perusosoite on: https://fleet-api.prd.eu.vn.cloud.tesla.com
 const REGION = process.env.TESLA_REGION || "eu";
 const FLEET_API_BASE = `https://fleet-api.prd.${REGION}.vn.cloud.tesla.com`;
-const FLEET_COMMAND_BASE = (process.env.TESLA_COMMAND_BASE || `https://fleet-command.prd.${REGION}.vn.cloud.tesla.com`).replace(/\/$/, "");
+const FLEET_COMMAND_BASES = buildFleetCommandBaseList();
 
 // 🧠 Yhtenäinen lokitus Render-logeihin
 function log() {
@@ -74,6 +74,96 @@ async function parseJsonResponse(response) {
   } catch (err) {
     return { data: null, raw: text };
   }
+}
+
+function buildFleetCommandBaseList() {
+  const bases = [];
+
+  const explicitList = process.env.TESLA_COMMAND_BASES;
+  if (explicitList && typeof explicitList === "string") {
+    const split = explicitList.split(/[,\s]+/);
+    for (let i = 0; i < split.length; i += 1) {
+      const candidate = split[i] || "";
+      if (candidate.trim()) {
+        bases.push(candidate.trim());
+      }
+    }
+  }
+
+  const override = (process.env.TESLA_COMMAND_BASE || "").trim();
+  if (override) {
+    bases.push(override);
+  }
+
+  bases.push(`https://fleet-command.prd.${REGION}.vn.cloud.tesla.com`);
+  bases.push("https://fleet-command.prd.vn.cloud.tesla.com");
+
+  if (REGION !== "na") {
+    bases.push("https://fleet-command.prd.na.vn.cloud.tesla.com");
+  }
+  if (REGION !== "eu") {
+    bases.push("https://fleet-command.prd.eu.vn.cloud.tesla.com");
+  }
+
+  const normalized = [];
+  for (let i = 0; i < bases.length; i += 1) {
+    const candidate = (bases[i] || "").trim();
+    if (!candidate) {
+      continue;
+    }
+    const cleaned = candidate.replace(/\/+$/, "");
+    if (normalized.indexOf(cleaned) === -1) {
+      normalized.push(cleaned);
+    }
+  }
+
+  return normalized;
+}
+
+function summarizeAttemptBody(raw) {
+  if (!raw || typeof raw !== "string") {
+    return undefined;
+  }
+
+  const limit = 512;
+  if (raw.length <= limit) {
+    return raw;
+  }
+
+  return `${raw.slice(0, limit)}…`;
+}
+
+function attachVcpAttempts(target, attempts) {
+  if (!attempts || !attempts.length) {
+    return target;
+  }
+
+  const list = [];
+  for (let i = 0; i < attempts.length; i += 1) {
+    const attempt = attempts[i];
+    const entry = {};
+    if (attempt && attempt.url) {
+      entry.url = attempt.url;
+    }
+    if (attempt && typeof attempt.status === "number") {
+      entry.status = attempt.status;
+    }
+    if (attempt && attempt.networkError) {
+      entry.networkError = attempt.networkError;
+    }
+    if (attempt && attempt.body) {
+      entry.body = summarizeAttemptBody(attempt.body);
+    }
+    if (Object.keys(entry).length > 0) {
+      list.push(entry);
+    }
+  }
+
+  if (list.length > 0) {
+    target.vcp_attempts = list;
+  }
+
+  return target;
 }
 
 /**
@@ -198,80 +288,111 @@ async function sendVehicleCommand(options) {
     ? randomUUID()
     : `cmd-${Date.now()}-${Math.random().toString(16).slice(2)}`;
 
-  const vcpPayload = {
-    command,
-    parameters: params,
-  };
+  const vcpAttempts = [];
 
-  const vcpTargets = [
-    `${FLEET_COMMAND_BASE}/api/1/vehicles/${vehicleId}/commands/${encodeURIComponent(command)}`,
-    `${FLEET_COMMAND_BASE}/api/1/vehicles/${vehicleId}/commands`,
-  ];
+  for (let baseIndex = 0; baseIndex < FLEET_COMMAND_BASES.length; baseIndex += 1) {
+    const base = FLEET_COMMAND_BASES[baseIndex];
+    const vcpTargets = [
+      {
+        url: `${base}/api/1/vehicles/${vehicleId}/commands/${encodeURIComponent(command)}`,
+        body: { parameters: params },
+      },
+      {
+        url: `${base}/api/1/vehicles/${vehicleId}/commands`,
+        body: { command, parameters: params },
+      },
+    ];
 
-  for (let i = 0; i < vcpTargets.length; i += 1) {
-    const vcpUrl = vcpTargets[i];
-    log("→ Forwarding command via VCP:", vcpUrl, "payload:", JSON.stringify(vcpPayload));
+    for (let i = 0; i < vcpTargets.length; i += 1) {
+      const target = vcpTargets[i];
+      log("→ Forwarding command via VCP:", target.url, "payload:", JSON.stringify(target.body));
 
-    const vcpResponse = await fetch(vcpUrl, {
+      let vcpResponse;
+      try {
+        vcpResponse = await fetch(target.url, {
+          method: "POST",
+          headers: {
+            Authorization: `Bearer ${token}`,
+            "Content-Type": "application/json",
+            "X-Tesla-Request-Id": requestId,
+          },
+          body: JSON.stringify(target.body),
+        });
+      } catch (err) {
+        log("⚠️ Tesla VCP command fetch error:", target.url, err);
+        vcpAttempts.push({ url: target.url, networkError: err && err.message ? err.message : String(err) });
+        continue;
+      }
+
+      const parsedVcp = await parseJsonResponse(vcpResponse);
+      const vcpBody = parsedVcp.data || {};
+
+      if (!vcpResponse.ok) {
+        vcpAttempts.push({ url: target.url, status: vcpResponse.status, body: parsedVcp.raw });
+
+        if (vcpResponse.status === 404) {
+          log("ℹ️ Tesla VCP endpoint returned 404, trying next variant:", target.url);
+          continue;
+        }
+
+        log("❌ Tesla VCP command error:", vcpResponse.status, parsedVcp.raw);
+        const errorPayload = {
+          error: vcpBody.error || vcpBody.message || "Tesla API HTTP error",
+        };
+        if (vcpBody && typeof vcpBody === "object" && Object.keys(vcpBody).length > 0) {
+          errorPayload.details = vcpBody;
+        } else if (parsedVcp.raw) {
+          errorPayload.details = parsedVcp.raw;
+        }
+        attachVcpAttempts(errorPayload, vcpAttempts);
+        return {
+          ok: false,
+          status: vcpResponse.status,
+          errorPayload,
+        };
+      }
+
+      const success = interpretCommandSuccess(vcpBody);
+      if (success) {
+        log("✅ Tesla command accepted via VCP:", command, "requestId:", requestId);
+      } else {
+        log("⚠️ Tesla command VCP response did not signal success explicitly:", parsedVcp.raw);
+      }
+      return {
+        ok: true,
+        status: vcpResponse.status,
+        success,
+        body: vcpBody,
+      };
+    }
+  }
+
+  const legacyUrl = `${FLEET_API_BASE}/api/1/vehicles/${vehicleId}/command/${command}`;
+  log("ℹ️ VCP endpoints unavailable, falling back to legacy command endpoint:", legacyUrl);
+
+  let legacyResponse;
+  try {
+    legacyResponse = await fetch(legacyUrl, {
       method: "POST",
       headers: {
         Authorization: `Bearer ${token}`,
         "Content-Type": "application/json",
-        "X-Tesla-Request-Id": requestId,
       },
-      body: JSON.stringify(vcpPayload),
+      body: JSON.stringify(params || {}),
     });
-
-    const parsedVcp = await parseJsonResponse(vcpResponse);
-    const vcpBody = parsedVcp.data || {};
-
-    if (!vcpResponse.ok) {
-      if (vcpResponse.status === 404) {
-        log("ℹ️ Tesla VCP endpoint returned 404, trying next variant:", vcpUrl);
-        continue;
-      }
-
-      log("❌ Tesla VCP command error:", vcpResponse.status, parsedVcp.raw);
-      const errorPayload = {
-        error: vcpBody.error || vcpBody.message || "Tesla API HTTP error",
-      };
-      if (vcpBody && typeof vcpBody === "object" && Object.keys(vcpBody).length > 0) {
-        errorPayload.details = vcpBody;
-      } else if (parsedVcp.raw) {
-        errorPayload.details = parsedVcp.raw;
-      }
-      return {
-        ok: false,
-        status: vcpResponse.status,
-        errorPayload,
-      };
-    }
-
-    const success = interpretCommandSuccess(vcpBody);
-    if (success) {
-      log("✅ Tesla command accepted via VCP:", command, "requestId:", requestId);
-    } else {
-      log("⚠️ Tesla command VCP response did not signal success explicitly:", parsedVcp.raw);
-    }
+  } catch (err) {
+    log("❌ Tesla legacy command fetch error:", err);
+    const errorPayload = {
+      error: "Tesla legacy command fetch failed",
+      details: { message: err && err.message ? err.message : String(err) },
+    };
+    attachVcpAttempts(errorPayload, vcpAttempts);
     return {
-      ok: true,
-      status: vcpResponse.status,
-      success,
-      body: vcpBody,
+      ok: false,
+      status: 502,
+      errorPayload,
     };
   }
-
-  const legacyUrl = `${FLEET_API_BASE}/api/1/vehicles/${vehicleId}/command/${command}`;
-  log("ℹ️ VCP endpoints returned 404, falling back to legacy command endpoint:", legacyUrl);
-
-  const legacyResponse = await fetch(legacyUrl, {
-    method: "POST",
-    headers: {
-      Authorization: `Bearer ${token}`,
-      "Content-Type": "application/json",
-    },
-    body: JSON.stringify(params || {}),
-  });
 
   const parsedLegacy = await parseJsonResponse(legacyResponse);
   const legacyBody = parsedLegacy.data || {};
@@ -286,6 +407,7 @@ async function sendVehicleCommand(options) {
     } else if (parsedLegacy.raw) {
       errorPayload.details = parsedLegacy.raw;
     }
+    attachVcpAttempts(errorPayload, vcpAttempts);
     return {
       ok: false,
       status: legacyResponse.status,
@@ -322,11 +444,25 @@ function interpretCommandSuccess(body) {
   }
 
   const statusFields = [payload.status, payload.state, payload.command_status];
+  const positiveStates = [
+    "accepted",
+    "acknowledged",
+    "queued",
+    "pending",
+    "received",
+    "in_progress",
+    "executing",
+    "sent",
+    "success",
+    "succeeded",
+    "completed",
+    "done",
+  ];
   for (let i = 0; i < statusFields.length; i += 1) {
     const value = statusFields[i];
     if (typeof value === "string") {
       const normalized = value.toLowerCase();
-      if (normalized === "accepted" || normalized === "queued" || normalized === "pending" || normalized === "in_progress" || normalized === "sent" || normalized === "success" || normalized === "succeeded" || normalized === "completed" || normalized === "done") {
+      if (positiveStates.indexOf(normalized) !== -1) {
         return true;
       }
     }
