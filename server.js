@@ -16,6 +16,7 @@ app.use(express.json());
 // EU-alueelle Fleet API:n perusosoite on: https://fleet-api.prd.eu.vn.cloud.tesla.com
 const REGION = process.env.TESLA_REGION || "eu";
 const FLEET_API_BASE = `https://fleet-api.prd.${REGION}.vn.cloud.tesla.com`;
+const FLEET_COMMAND_BASE = (process.env.TESLA_COMMAND_BASE || `https://fleet-command.prd.${REGION}.vn.cloud.tesla.com`).replace(/\/$/, "");
 
 // 🧠 Yhtenäinen lokitus Render-logeihin
 function log() {
@@ -158,8 +159,7 @@ app.post("/command/:vehicleId/:command", async (req, res) => {
       return res.status(404).json({
         error: "Vehicle not found",
         details: {
-          message:
-            "VIN tai ajoneuvo-ID ei löytynyt Tesla Fleet API:n kautta. Varmista, että ajoneuvo on jaettu sovellukselle ja että tokenilla on oikeudet.",
+          message: "VIN tai ajoneuvo-ID ei löytynyt Tesla Fleet API:n kautta. Varmista, että ajoneuvo on jaettu sovellukselle ja että tokenilla on oikeudet.",
           provided: rawVehicleId,
         },
       });
@@ -198,45 +198,55 @@ async function sendVehicleCommand(options) {
     ? randomUUID()
     : `cmd-${Date.now()}-${Math.random().toString(16).slice(2)}`;
 
-  const vcpUrl = `${FLEET_API_BASE}/api/1/vehicles/${vehicleId}/commands`;
-  const payload = {
+  const vcpPayload = {
     command,
     parameters: params,
   };
 
-  log("→ Forwarding command via VCP:", vcpUrl, "payload:", JSON.stringify(payload));
+  const vcpTargets = [
+    `${FLEET_COMMAND_BASE}/api/1/vehicles/${vehicleId}/commands/${encodeURIComponent(command)}`,
+    `${FLEET_COMMAND_BASE}/api/1/vehicles/${vehicleId}/commands`,
+  ];
 
-  const vcpResponse = await fetch(vcpUrl, {
-    method: "POST",
-    headers: {
-      Authorization: `Bearer ${token}`,
-      "Content-Type": "application/json",
-      "X-Tesla-Request-Id": requestId,
-    },
-    body: JSON.stringify(payload),
-  });
+  for (let i = 0; i < vcpTargets.length; i += 1) {
+    const vcpUrl = vcpTargets[i];
+    log("→ Forwarding command via VCP:", vcpUrl, "payload:", JSON.stringify(vcpPayload));
 
-  const parsedVcp = await parseJsonResponse(vcpResponse);
-  const vcpBody = parsedVcp.data || {};
+    const vcpResponse = await fetch(vcpUrl, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${token}`,
+        "Content-Type": "application/json",
+        "X-Tesla-Request-Id": requestId,
+      },
+      body: JSON.stringify(vcpPayload),
+    });
 
-  if (!vcpResponse.ok && vcpResponse.status !== 404) {
-    log("❌ Tesla VCP command error:", vcpResponse.status, parsedVcp.raw);
-    const errorPayload = {
-      error: vcpBody.error || vcpBody.message || "Tesla API HTTP error",
-    };
-    if (vcpBody && typeof vcpBody === "object" && Object.keys(vcpBody).length > 0) {
-      errorPayload.details = vcpBody;
-    } else if (parsedVcp.raw) {
-      errorPayload.details = parsedVcp.raw;
+    const parsedVcp = await parseJsonResponse(vcpResponse);
+    const vcpBody = parsedVcp.data || {};
+
+    if (!vcpResponse.ok) {
+      if (vcpResponse.status === 404) {
+        log("ℹ️ Tesla VCP endpoint returned 404, trying next variant:", vcpUrl);
+        continue;
+      }
+
+      log("❌ Tesla VCP command error:", vcpResponse.status, parsedVcp.raw);
+      const errorPayload = {
+        error: vcpBody.error || vcpBody.message || "Tesla API HTTP error",
+      };
+      if (vcpBody && typeof vcpBody === "object" && Object.keys(vcpBody).length > 0) {
+        errorPayload.details = vcpBody;
+      } else if (parsedVcp.raw) {
+        errorPayload.details = parsedVcp.raw;
+      }
+      return {
+        ok: false,
+        status: vcpResponse.status,
+        errorPayload,
+      };
     }
-    return {
-      ok: false,
-      status: vcpResponse.status,
-      errorPayload,
-    };
-  }
 
-  if (vcpResponse.ok) {
     const success = interpretCommandSuccess(vcpBody);
     if (success) {
       log("✅ Tesla command accepted via VCP:", command, "requestId:", requestId);
@@ -251,9 +261,8 @@ async function sendVehicleCommand(options) {
     };
   }
 
-  // VCP endpoint returned 404; fall back to legacy REST command route for backwards compatibility.
   const legacyUrl = `${FLEET_API_BASE}/api/1/vehicles/${vehicleId}/command/${command}`;
-  log("ℹ️ VCP endpoint returned 404, falling back to legacy command endpoint:", legacyUrl);
+  log("ℹ️ VCP endpoints returned 404, falling back to legacy command endpoint:", legacyUrl);
 
   const legacyResponse = await fetch(legacyUrl, {
     method: "POST",
