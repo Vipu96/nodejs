@@ -144,14 +144,15 @@ function interpretCommandSuccess(body) {
   return false;
 }
 
-async function resolveVehicleId(vehicleIdentifier, token) {
-  if (/^\d+$/.test(String(vehicleIdentifier))) return String(vehicleIdentifier);
-
-  const vin = String(vehicleIdentifier || "").trim().toUpperCase();
-  if (!vin) return null;
+/**
+ * Hakee sekä id:n että VINin. Syöte voi olla VIN tai numeerinen id.
+ */
+async function resolveVehicleRecord(vehicleIdentifier, token) {
+  const maybeVin = String(vehicleIdentifier || "").trim().toUpperCase();
+  const looksLikeVin = /^[A-HJ-NPR-Z0-9]{17}$/.test(maybeVin);
 
   const url = `${FLEET_API_BASE}/api/1/vehicles`;
-  log("🔍 Resolving VIN via:", url);
+  log("🔍 Resolving vehicle via:", url);
 
   const response = await fetch(url, {
     method: "GET",
@@ -160,19 +161,21 @@ async function resolveVehicleId(vehicleIdentifier, token) {
 
   const parsed = await parseJsonResponse(response);
   if (!response.ok) {
-    log("❌ VIN resolution failed:", response.status, parsed.raw);
+    log("❌ /vehicles failed:", response.status, parsed.raw);
     return null;
   }
 
   const vehicles = Array.isArray(parsed.data?.response) ? parsed.data.response : [];
   for (const v of vehicles) {
-    const vehicleVin = String(v?.vin || "").toUpperCase();
-    if (vehicleVin === vin && v?.id) {
-      log(`✅ VIN ${vin} resolved to vehicle id ${v.id}`);
-      return String(v.id);
+    const vid = String(v?.id || "");
+    const vvin = String(v?.vin || "").toUpperCase();
+    if ((looksLikeVin && vvin === maybeVin) || (!looksLikeVin && vid === String(vehicleIdentifier))) {
+      const rec = { id: vid, vin: vvin };
+      log(`✅ Resolved vehicle: id=${rec.id} vin=${rec.vin}`);
+      return rec;
     }
   }
-  log(`⚠️ VIN ${vin} not found in Tesla vehicle list.`);
+  log("⚠️ Vehicle not found from list.");
   return null;
 }
 
@@ -244,11 +247,11 @@ app.post("/info", async (req, res) => {
  */
 app.post("/command/:vehicleId/:command", async (req, res) => {
   const token = extractAccessToken(req);
-  const rawVehicleId = req.params.vehicleId;
+  const rawVehicleIdOrVin = req.params.vehicleId;
   const command = req.params.command;
   const params = extractCommandParams(req.body);
 
-  log(`➡️ Command received: /command/${rawVehicleId}/${command}`);
+  log(`➡️ Command received: /command/${rawVehicleIdOrVin}/${command}`);
 
   if (!token) {
     return res.status(400).json({
@@ -258,25 +261,23 @@ app.post("/command/:vehicleId/:command", async (req, res) => {
   }
 
   try {
-    const vehicleId = await resolveVehicleId(rawVehicleId, token);
-    if (!vehicleId) {
+    const rec = await resolveVehicleRecord(rawVehicleIdOrVin, token);
+    if (!rec) {
       return res.status(404).json({
         error: "Vehicle not found",
-        details: {
-          message: "VIN tai ajoneuvo-ID ei löytynyt /vehicles-listauksesta. Varmista jakaminen ja oikeudet.",
-          provided: rawVehicleId,
-        },
+        details: { message: "VIN/ID ei löytynyt /vehicles-listauksesta.", provided: rawVehicleIdOrVin },
       });
     }
 
-    const result = await sendVehicleCommand({ vehicleId, command, params, token });
+    const result = await sendVehicleCommand({ vehicleId: rec.id, vin: rec.vin, command, params, token });
     if (!result.ok) {
       return res.status(result.status).json(result.errorPayload);
     }
     return res.json({
       success: result.success,
       command,
-      vehicleId,
+      vehicleId: rec.id,
+      vin: rec.vin,
       response: result.body,
     });
   } catch (err) {
@@ -286,9 +287,9 @@ app.post("/command/:vehicleId/:command", async (req, res) => {
 });
 
 // -----------------------------------------------------------------------------
-// Komentojen välitys: Proxy (allekirjoitettu VCP) -> suora VCP -> legacy
+// Komentojen välitys: Proxy (allekirjoitettu VCP, VIN polussa) -> suora VCP (id) -> legacy (id)
 // -----------------------------------------------------------------------------
-async function sendVehicleCommand({ vehicleId, command, params, token }) {
+async function sendVehicleCommand({ vehicleId, vin, command, params, token }) {
   const requestId = typeof randomUUID === "function"
     ? randomUUID()
     : `cmd-${Date.now()}-${Math.random().toString(16).slice(2)}`;
@@ -296,37 +297,16 @@ async function sendVehicleCommand({ vehicleId, command, params, token }) {
   // 1) SUOSITELTU: Tesla Vehicle Command HTTP proxy (allekirjoitus TESLA_PRIVATE_KEY:llä proxyn puolella)
   if (VCP_PROXY_BASE) {
     const base = VCP_PROXY_BASE.replace(/\/+$/, "");
+    const vinPath = encodeURIComponent(vin);
 
     // Kokeile useita proxy-reittimuotoja – eri buildit käyttävät eri polkuja
     const proxyVariants = [
-      // Yleisin
-      {
-        url: `${base}/api/1/vehicles/${encodeURIComponent(vehicleId)}/commands/${encodeURIComponent(command)}`,
-        body: params || {},
-      },
-      // Wrapper-versio
-      {
-        url: `${base}/api/1/vehicles/${encodeURIComponent(vehicleId)}/commands`,
-        body: { command, parameters: params || {} },
-      },
-      // Joissain kokoonpanoissa ei ole /api/1 -prefiksiä
-      {
-        url: `${base}/vehicles/${encodeURIComponent(vehicleId)}/commands/${encodeURIComponent(command)}`,
-        body: params || {},
-      },
-      {
-        url: `${base}/vehicles/${encodeURIComponent(vehicleId)}/commands`,
-        body: { command, parameters: params || {} },
-      },
-      // Harvinaisempi yksikkömuoto
-      {
-        url: `${base}/api/1/vehicles/${encodeURIComponent(vehicleId)}/command/${encodeURIComponent(command)}`,
-        body: params || {},
-      },
-      {
-        url: `${base}/vehicles/${encodeURIComponent(vehicleId)}/command/${encodeURIComponent(command)}`,
-        body: params || {},
-      },
+      { url: `${base}/api/1/vehicles/${vinPath}/commands/${encodeURIComponent(command)}`, body: params || {} },
+      { url: `${base}/api/1/vehicles/${vinPath}/commands`, body: { command, parameters: params || {} } },
+      { url: `${base}/vehicles/${vinPath}/commands/${encodeURIComponent(command)}`, body: params || {} },
+      { url: `${base}/vehicles/${vinPath}/commands`, body: { command, parameters: params || {} } },
+      { url: `${base}/api/1/vehicles/${vinPath}/command/${encodeURIComponent(command)}`, body: params || {} },
+      { url: `${base}/vehicles/${vinPath}/command/${encodeURIComponent(command)}`, body: params || {} },
     ];
 
     for (const variant of proxyVariants) {
