@@ -16,7 +16,7 @@ app.use(express.json());
 // EU-alueelle Fleet API:n perusosoite on: https://fleet-api.prd.eu.vn.cloud.tesla.com
 const REGION = process.env.TESLA_REGION || "eu";
 const FLEET_API_BASE = `https://fleet-api.prd.${REGION}.vn.cloud.tesla.com`;
-const FLEET_COMMAND_BASE = determineFleetCommandBase();
+const FLEET_COMMAND_BASES = buildFleetCommandBaseList();
 
 // 🧠 Yhtenäinen lokitus Render-logeihin
 function log() {
@@ -76,32 +76,60 @@ async function parseJsonResponse(response) {
   }
 }
 
-function determineFleetCommandBase() {
-  const override = process.env.TESLA_COMMAND_BASE;
-  const base = override && override.trim().length > 0
-    ? override.trim()
-    : `https://fleet-command.prd.${REGION}.vn.cloud.tesla.com`;
+function buildFleetCommandBaseList() {
+  const bases = [];
 
-  const prefixed = base.indexOf("http") === 0 ? base : `https://${base}`;
-  const cleaned = prefixed.replace(/\/+$/, "");
-
-  log("Using Vehicle Command Protocol base:", cleaned);
-  return cleaned;
-}
-
-function formatNetworkError(err) {
-  if (!err || typeof err !== "object") {
-    return String(err);
+  const explicitList = process.env.TESLA_COMMAND_BASES;
+  if (explicitList && typeof explicitList === "string") {
+    const split = explicitList.split(/[,\s]+/);
+    for (let i = 0; i < split.length; i += 1) {
+      const candidate = split[i] || "";
+      if (candidate.trim()) {
+        bases.push(candidate.trim());
+      }
+    }
   }
 
-  let message = err.message || String(err);
-  if (err.cause && err.cause.message) {
-    message += ` (cause: ${err.cause.message})`;
+  const override = (process.env.TESLA_COMMAND_BASE || "").trim();
+  if (override) {
+    bases.push(override);
   }
-  if (err.code) {
-    message += ` [code: ${err.code}]`;
+
+  // Always try the configured Fleet API base as the first fallback since some
+  // regions expose the Vehicle Command Protocol on the data host itself.
+  bases.push(FLEET_API_BASE);
+
+  // Known Tesla-hosted Fleet Command domains (region-scoped and global).
+  bases.push(`https://fleet-command.prd.${REGION}.vn.cloud.tesla.com`);
+  bases.push("https://fleet-command.prd.vn.cloud.tesla.com");
+  bases.push("https://fleet-command.vn.cloud.tesla.com");
+
+  if (REGION !== "na") {
+    bases.push("https://fleet-command.prd.na.vn.cloud.tesla.com");
   }
-  return message;
+  if (REGION !== "eu") {
+    bases.push("https://fleet-command.prd.eu.vn.cloud.tesla.com");
+  }
+
+  // Allow override hosts without scheme (e.g. fleet-command.prd.eu.vn.cloud.tesla.com)
+  // by normalising below.
+
+  const normalized = [];
+  for (let i = 0; i < bases.length; i += 1) {
+    const candidate = (bases[i] || "").trim();
+    if (!candidate) {
+      continue;
+    }
+    const prefixed = candidate.indexOf("http") === 0 ? candidate : `https://${candidate}`;
+    const cleaned = prefixed.replace(/\/+$/, "");
+    if (normalized.indexOf(cleaned) === -1) {
+      normalized.push(cleaned);
+    }
+  }
+
+  console.log("[TeslaThirdPartyProxy] Fleet command base candidates:", normalized.join(", "));
+
+  return normalized;
 }
 
 function summarizeAttemptBody(raw) {
@@ -134,9 +162,6 @@ function attachVcpAttempts(target, attempts) {
     }
     if (attempt && attempt.networkError) {
       entry.networkError = attempt.networkError;
-    }
-    if (attempt && attempt.code) {
-      entry.code = attempt.code;
     }
     if (attempt && attempt.body) {
       entry.body = summarizeAttemptBody(attempt.body);
@@ -277,97 +302,149 @@ async function sendVehicleCommand(options) {
 
   const vcpAttempts = [];
 
-  const vcpTargets = [
-    {
-      url: `${FLEET_COMMAND_BASE}/api/1/vehicles/${vehicleId}/commands`,
-      body: { command, parameters: params },
-    },
-    {
-      url: `${FLEET_COMMAND_BASE}/api/1/vehicles/${vehicleId}/commands/${encodeURIComponent(command)}`,
-      body: { parameters: params },
-    },
-  ];
+  for (let baseIndex = 0; baseIndex < FLEET_COMMAND_BASES.length; baseIndex += 1) {
+    const base = FLEET_COMMAND_BASES[baseIndex];
+    const vcpTargets = [
+      {
+        url: `${base}/api/1/vehicles/${vehicleId}/commands/${encodeURIComponent(command)}`,
+        body: { parameters: params },
+      },
+      {
+        url: `${base}/api/1/vehicles/${vehicleId}/commands`,
+        body: { command, parameters: params },
+      },
+    ];
 
-  let lastStatus = 502;
-  let lastErrorPayload = {
-    error: "Vehicle Command Protocol request failed",
-  };
+    for (let i = 0; i < vcpTargets.length; i += 1) {
+      const target = vcpTargets[i];
+      log("→ Forwarding command via VCP:", target.url, "payload:", JSON.stringify(target.body));
 
-  for (let i = 0; i < vcpTargets.length; i += 1) {
-    const target = vcpTargets[i];
-    log("→ Forwarding command via VCP:", target.url, "payload:", JSON.stringify(target.body));
-
-    let vcpResponse;
-    try {
-      vcpResponse = await fetch(target.url, {
-        method: "POST",
-        headers: {
-          Authorization: `Bearer ${token}`,
-          "Content-Type": "application/json",
-          "X-Tesla-Request-Id": requestId,
-        },
-        body: JSON.stringify(target.body),
-      });
-    } catch (err) {
-      const message = formatNetworkError(err);
-      log("⚠️ Tesla VCP command fetch error:", target.url, message);
-      const attemptDetails = { url: target.url, networkError: message };
-      if (err && err.code) {
-        attemptDetails.code = err.code;
-      } else if (err && err.cause && err.cause.code) {
-        attemptDetails.code = err.cause.code;
+      let vcpResponse;
+      try {
+        vcpResponse = await fetch(target.url, {
+          method: "POST",
+          headers: {
+            Authorization: `Bearer ${token}`,
+            "Content-Type": "application/json",
+            "X-Tesla-Request-Id": requestId,
+          },
+          body: JSON.stringify(target.body),
+        });
+      } catch (err) {
+        log("⚠️ Tesla VCP command fetch error:", target.url, err);
+        vcpAttempts.push({ url: target.url, networkError: err && err.message ? err.message : String(err) });
+        continue;
       }
-      vcpAttempts.push(attemptDetails);
-      lastStatus = 502;
-      lastErrorPayload = {
-        error: "Vehicle Command Protocol network failure",
-        details: { message },
+
+      const parsedVcp = await parseJsonResponse(vcpResponse);
+      const vcpBody = parsedVcp.data || {};
+
+      if (!vcpResponse.ok) {
+        vcpAttempts.push({ url: target.url, status: vcpResponse.status, body: parsedVcp.raw });
+
+        if (vcpResponse.status === 404) {
+          log("ℹ️ Tesla VCP endpoint returned 404, trying next variant:", target.url);
+          continue;
+        }
+
+        log("❌ Tesla VCP command error:", vcpResponse.status, parsedVcp.raw);
+        const errorPayload = {
+          error: vcpBody.error || vcpBody.message || "Tesla API HTTP error",
+        };
+        if (vcpBody && typeof vcpBody === "object" && Object.keys(vcpBody).length > 0) {
+          errorPayload.details = vcpBody;
+        } else if (parsedVcp.raw) {
+          errorPayload.details = parsedVcp.raw;
+        }
+        if (vcpAttempts.length > 0) {
+          errorPayload.hint = "Verify the Vehicle Command Protocol endpoint (TESLA_COMMAND_BASES) matches the host documented at https://github.com/teslamotors/vehicle-command.";
+        }
+        attachVcpAttempts(errorPayload, vcpAttempts);
+        return {
+          ok: false,
+          status: vcpResponse.status,
+          errorPayload,
+        };
+      }
+
+      const success = interpretCommandSuccess(vcpBody);
+      if (success) {
+        log("✅ Tesla command accepted via VCP:", command, "requestId:", requestId);
+      } else {
+        log("⚠️ Tesla command VCP response did not signal success explicitly:", parsedVcp.raw);
+      }
+      return {
+        ok: true,
+        status: vcpResponse.status,
+        success,
+        body: vcpBody,
       };
-      if (attemptDetails.code === "ENOTFOUND") {
-        lastErrorPayload.details.hint = "Check TESLA_COMMAND_BASE (e.g. https://fleet-command.prd.vn.cloud.tesla.com).";
-      }
-      continue;
     }
+  }
 
-    const parsedVcp = await parseJsonResponse(vcpResponse);
-    const vcpBody = parsedVcp.data || {};
+  const legacyUrl = `${FLEET_API_BASE}/api/1/vehicles/${vehicleId}/command/${command}`;
+  log("ℹ️ VCP endpoints unavailable, falling back to legacy command endpoint:", legacyUrl);
 
-    if (!vcpResponse.ok) {
-      vcpAttempts.push({ url: target.url, status: vcpResponse.status, body: parsedVcp.raw });
-      log("❌ Tesla VCP command error:", vcpResponse.status, parsedVcp.raw);
-
-      const errorPayload = {
-        error: vcpBody.error || vcpBody.message || "Tesla API HTTP error",
-      };
-      if (vcpBody && typeof vcpBody === "object" && Object.keys(vcpBody).length > 0) {
-        errorPayload.details = vcpBody;
-      } else if (parsedVcp.raw) {
-        errorPayload.details = parsedVcp.raw;
-      }
-      lastStatus = vcpResponse.status;
-      lastErrorPayload = errorPayload;
-      continue;
-    }
-
-    const success = interpretCommandSuccess(vcpBody);
-    if (success) {
-      log("✅ Tesla command accepted via VCP:", command, "requestId:", requestId);
-    } else {
-      log("⚠️ Tesla command VCP response did not signal success explicitly:", parsedVcp.raw);
-    }
+  let legacyResponse;
+  try {
+    legacyResponse = await fetch(legacyUrl, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${token}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify(params || {}),
+    });
+  } catch (err) {
+    log("❌ Tesla legacy command fetch error:", err);
+    const errorPayload = {
+      error: "Tesla legacy command fetch failed",
+      details: { message: err && err.message ? err.message : String(err) },
+    };
+    attachVcpAttempts(errorPayload, vcpAttempts);
     return {
-      ok: true,
-      status: vcpResponse.status,
-      success,
-      body: vcpBody,
+      ok: false,
+      status: 502,
+      errorPayload,
     };
   }
 
-  attachVcpAttempts(lastErrorPayload, vcpAttempts);
+  const parsedLegacy = await parseJsonResponse(legacyResponse);
+  const legacyBody = parsedLegacy.data || {};
+
+  if (!legacyResponse.ok) {
+    log("❌ Tesla legacy command error:", legacyResponse.status, parsedLegacy.raw);
+    const errorPayload = {
+      error: legacyBody.error || legacyBody.message || "Tesla API HTTP error",
+    };
+    if (legacyBody && typeof legacyBody === "object" && Object.keys(legacyBody).length > 0) {
+      errorPayload.details = legacyBody;
+    } else if (parsedLegacy.raw) {
+      errorPayload.details = parsedLegacy.raw;
+    }
+    if (vcpAttempts.length > 0) {
+      errorPayload.hint = "Vehicle Command Protocol host unreachable or rejected. Set TESLA_COMMAND_BASES to the documented command endpoint from https://github.com/teslamotors/vehicle-command.";
+    }
+    attachVcpAttempts(errorPayload, vcpAttempts);
+    return {
+      ok: false,
+      status: legacyResponse.status,
+      errorPayload,
+    };
+  }
+
+  const success = interpretCommandSuccess(legacyBody);
+  if (success) {
+    log("✅ Tesla command succeeded via legacy endpoint:", command);
+  } else {
+    log("⚠️ Tesla legacy command response did not signal success explicitly:", parsedLegacy.raw);
+  }
+
   return {
-    ok: false,
-    status: lastStatus,
-    errorPayload: lastErrorPayload,
+    ok: true,
+    status: legacyResponse.status,
+    success,
+    body: legacyBody,
   };
 }
 
