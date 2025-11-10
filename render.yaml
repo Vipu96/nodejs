@@ -1,10 +1,32 @@
 services:
+  # 1) Node-proxy (sinun server.js)
+  - type: web
+    name: tesla-node-proxy
+    env: node
+    plan: starter
+    buildCommand: "npm ci"
+    startCommand: "npm start"
+    healthCheckPath: "/"
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: TESLA_REGION
+        value: eu
+      - key: TESLA_VCP_PROXY_BASE
+        # Päivitä tähän VCP-palvelusi julkinen https-osoite (luodaan alla).
+        value: https://vcp-core.onrender.com
+      # (valinnainen) salli suorat VCP-yritykset EU:hun (yleensä ei tarvetta)
+      # - key: TESLA_ALLOW_DIRECT_VCP
+      #   value: "false"
+
+  # 2) Tesla Vehicle Command HTTP proxy (teslamotors/vehicle-command)
   - type: web
     name: vcp-core
     env: docker
     plan: starter
-    healthCheckPath: /
     dockerfilePath: ./Dockerfile.vcp
+    healthCheckPath: "/"
+    autoDeploy: true
     envVars:
       - key: TESLA_PRIVATE_KEY_PEM
-        sync: false   # syötä arvo Renderin dashboardissa (ECDSA P-256 PEM)
+        sync: false   # syötä Renderin UI:ssa arvo (ECDSA P-256 yksityinen PEM)
