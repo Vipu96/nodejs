@@ -12,7 +12,7 @@ services:
         value: production
       - key: TESLA_VCP_PROXY_BASE
         # <-- PÄIVITÄ kun VCP on deploattu ja sinulla on sen URL (alla syntyy esim. https://vcp-core.onrender.com)
-        value: https://vcp-core.onrender.com
+        value: https://vehicle-command-08rv.onrender.com
       # (valinnainen) salli suora VCP EU:hun, yleensä ei tarvetta:
       # - key: TESLA_ALLOW_DIRECT_VCP
       #   value: "false"
