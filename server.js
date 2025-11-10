@@ -2,33 +2,31 @@
  * Tesla Third-Party Proxy (Authorization Code / User Tokens)
  * ----------------------------------------------------------
  * Render-palvelin, joka vastaanottaa Cloudflarelta (tai muilta integraatioilta)
- * komennot ja välittää ne Teslan Vehicle Command -proxyyn (allekirjoitus TESLA_PRIVATE_KEY:llä)
- * tai suoraan Teslan Fleet/VCP-päätepisteisiin fallbackina.
+ * komennot ja välittää ne Teslan Vehicle Command -proxyyn (allekirjoitettu VCP),
+ * tai fallbackina suoraan VCP/legacy -päätepisteisiin.
  *
  * Yhteensopiva Cloudflare Worker -rajapinnan kanssa:
- *   POST /info                   { token }
- *   POST /command/:vehicleId/:command   { token, params }
+ *   POST /info                          body: { token: "<access_token>" }
+ *   POST /command/:vehicleId/:command   body: { token: "<access_token>", params: { ... } }
  *
- * Ympäristömuuttujat (Render):
- *   TESLA_REGION=eu | na (oletus: eu)
- *   TESLA_VCP_PROXY_BASE=https://vcp-proxy.onrender.com   <-- SUOSITELTU (allekirjoittaa VCP:n)
- *   TESLA_COMMAND_BASES=comma,separated,override-hosts     <-- valinnainen (suorat VCP-yritykset)
- *   TESLA_COMMAND_BASE=single-host-override                 <-- valinnainen
- *   TESLA_DOMAIN=myspot.fi                                  <-- valinnainen (health/info)
- *
- * HUOM: Allekirjoitus tehdään Vehicle Command HTTP proxyssä,
- * johon on asennettu TESLA_PRIVATE_KEY (ECDSA P-256). Tämä noudattaa Teslan ohjetta.
+ * ENV (Render):
+ *   TESLA_REGION=eu|na (oletus eu)
+ *   TESLA_VCP_PROXY_BASE=https://vcp-proxy.onrender.com   <-- SUOSITELTU (proxy allekirjoittaa VCP:n)
+ *   TESLA_RENDER_PROXY=https://vcp-proxy.onrender.com     <-- tuetaan myös (fallback nimenä)
+ *   TESLA_COMMAND_BASES=comma,separated,override-hosts    <-- valinnainen suoriin VCP-yrityksiin
+ *   TESLA_COMMAND_BASE=single-host-override               <-- valinnainen
+ *   TESLA_DOMAIN=myspot.fi                                <-- valinnainen (health/debug)
  */
 
 import express from "express";
 import { randomUUID } from "crypto";
 
-// -----------------------------------------------------------------------------
-// Peruskonfiguraatio
-// -----------------------------------------------------------------------------
 const app = express();
 app.use(express.json());
 
+// -----------------------------------------------------------------------------
+// Peruskonfiguraatio
+// -----------------------------------------------------------------------------
 const REGION = (process.env.TESLA_REGION || "eu").trim();
 const FLEET_API_BASE = `https://fleet-api.prd.${REGION}.vn.cloud.tesla.com`;
 const VCP_PROXY_BASE = (process.env.TESLA_VCP_PROXY_BASE || process.env.TESLA_RENDER_PROXY || "").trim();
@@ -79,6 +77,7 @@ async function parseJsonResponse(response) {
 
 function buildFleetCommandBaseList() {
   const bases = [];
+
   const explicitList = process.env.TESLA_COMMAND_BASES;
   if (explicitList && typeof explicitList === "string") {
     explicitList.split(/[,\s]+/).forEach((c) => c && bases.push(c.trim()));
@@ -170,7 +169,7 @@ async function resolveVehicleId(vehicleIdentifier, token) {
     const vehicleVin = String(v?.vin || "").toUpperCase();
     if (vehicleVin === vin && v?.id) {
       log(`✅ VIN ${vin} resolved to vehicle id ${v.id}`);
-      return v.id;
+      return String(v.id);
     }
   }
   log(`⚠️ VIN ${vin} not found in Tesla vehicle list.`);
@@ -294,55 +293,92 @@ async function sendVehicleCommand({ vehicleId, command, params, token }) {
     ? randomUUID()
     : `cmd-${Date.now()}-${Math.random().toString(16).slice(2)}`;
 
-  // 1) SUOSITELTU: Tesla Vehicle Command HTTP proxy (allekirjoitus TESLA_PRIVATE_KEY:llä)
+  // 1) SUOSITELTU: Tesla Vehicle Command HTTP proxy (allekirjoitus TESLA_PRIVATE_KEY:llä proxyn puolella)
   if (VCP_PROXY_BASE) {
-    const proxyUrl = `${VCP_PROXY_BASE.replace(/\/+$/, "")}/api/1/vehicles/${encodeURIComponent(
-      vehicleId
-    )}/command/${encodeURIComponent(command)}`;
+    const base = VCP_PROXY_BASE.replace(/\/+$/, "");
 
-    log("→ Forwarding command to Tesla HTTP proxy (signed VCP):", proxyUrl, "payload:", JSON.stringify(params || {}));
+    // Kokeile useita proxy-reittimuotoja – eri buildit käyttävät eri polkuja
+    const proxyVariants = [
+      // Yleisin
+      {
+        url: `${base}/api/1/vehicles/${encodeURIComponent(vehicleId)}/commands/${encodeURIComponent(command)}`,
+        body: params || {},
+      },
+      // Wrapper-versio
+      {
+        url: `${base}/api/1/vehicles/${encodeURIComponent(vehicleId)}/commands`,
+        body: { command, parameters: params || {} },
+      },
+      // Joissain kokoonpanoissa ei ole /api/1 -prefiksiä
+      {
+        url: `${base}/vehicles/${encodeURIComponent(vehicleId)}/commands/${encodeURIComponent(command)}`,
+        body: params || {},
+      },
+      {
+        url: `${base}/vehicles/${encodeURIComponent(vehicleId)}/commands`,
+        body: { command, parameters: params || {} },
+      },
+      // Harvinaisempi yksikkömuoto
+      {
+        url: `${base}/api/1/vehicles/${encodeURIComponent(vehicleId)}/command/${encodeURIComponent(command)}`,
+        body: params || {},
+      },
+      {
+        url: `${base}/vehicles/${encodeURIComponent(vehicleId)}/command/${encodeURIComponent(command)}`,
+        body: params || {},
+      },
+    ];
 
-    let proxyResp;
-    try {
-      proxyResp = await fetch(proxyUrl, {
-        method: "POST",
-        headers: {
-          Authorization: `Bearer ${token}`,
-          "Content-Type": "application/json",
-          "X-Tesla-Request-Id": requestId,
-        },
-        body: JSON.stringify(params || {}),
-      });
-    } catch (err) {
-      log("❌ Proxy fetch error:", err);
-      return {
-        ok: false,
-        status: 502,
-        errorPayload: { error: "Tesla proxy fetch failed", details: { message: err?.message || String(err) } },
-      };
+    for (const variant of proxyVariants) {
+      log("→ Proxy try:", variant.url, "payload:", JSON.stringify(variant.body));
+      let resp;
+      try {
+        resp = await fetch(variant.url, {
+          method: "POST",
+          headers: {
+            Authorization: `Bearer ${token}`,
+            "Content-Type": "application/json",
+            "X-Tesla-Request-Id": requestId,
+          },
+          body: JSON.stringify(variant.body),
+        });
+      } catch (err) {
+        log("❌ Proxy network error:", variant.url, err);
+        continue; // kokeillaan seuraavaa variaatiota
+      }
+
+      const parsed = await parseJsonResponse(resp);
+      const body = parsed.data || {};
+
+      if (resp.status === 404) {
+        // väärä reitti tälle proxylle -> kokeile seuraavaa
+        log("ℹ️ Proxy 404 (route mismatch), trying next:", variant.url);
+        continue;
+      }
+
+      if (!resp.ok) {
+        log("❌ Proxy error:", resp.status, parsed.raw);
+        return {
+          ok: false,
+          status: resp.status,
+          errorPayload: {
+            error: body?.error || body?.message || "Tesla proxy HTTP error",
+            details: body?.details || parsed.raw,
+          },
+        };
+      }
+
+      const success = interpretCommandSuccess(body);
+      if (success) {
+        log("✅ Command accepted via signed VCP proxy:", command, "requestId:", requestId);
+      } else {
+        log("⚠️ Proxy response did not explicitly signal success:", parsed.raw);
+      }
+      return { ok: true, status: resp.status, success, body };
     }
 
-    const parsed = await parseJsonResponse(proxyResp);
-    const body = parsed.data || {};
-    if (!proxyResp.ok) {
-      log("❌ Proxy error:", proxyResp.status, parsed.raw);
-      return {
-        ok: false,
-        status: proxyResp.status,
-        errorPayload: {
-          error: body?.error || body?.message || "Tesla proxy HTTP error",
-          details: body?.details || parsed.raw,
-        },
-      };
-    }
-
-    const success = interpretCommandSuccess(body);
-    if (success) {
-      log("✅ Command accepted via signed VCP proxy:", command, "requestId:", requestId);
-    } else {
-      log("⚠️ Proxy response did not explicitly signal success:", parsed.raw);
-    }
-    return { ok: true, status: proxyResp.status, success, body };
+    // Jos kaikki proxy-reitit antoivat 404 → jatka VCP/legacy-fallbackeihin
+    log("ℹ️ All proxy variants 404 → falling back to direct VCP / legacy");
   }
 
   // 2) Suorat VCP-yritykset (ilman allekirjoitusta) – usein 404/403 jos allekirjoitusta vaaditaan
@@ -413,7 +449,6 @@ async function sendVehicleCommand({ vehicleId, command, params, token }) {
   } catch (err) {
     log("❌ Tesla legacy command fetch error:", err);
     const errorPayload = { error: "Tesla legacy command fetch failed", details: { message: err?.message || String(err) } };
-    attachVcpAttempts(errorPayload, vcpAttempts);
     return { ok: false, status: 502, errorPayload };
   }
 
@@ -425,7 +460,6 @@ async function sendVehicleCommand({ vehicleId, command, params, token }) {
       error: legacyBody?.error || legacyBody?.message || "Tesla API HTTP error",
       details: legacyBody || parsedLegacy.raw,
     };
-    attachVcpAttempts(errorPayload, vcpAttempts);
     return { ok: false, status: legacyResponse.status, errorPayload };
   }
 
