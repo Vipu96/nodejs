@@ -1,0 +1,57 @@
+services:
+  # A) PRIVATE: Tesla Vehicle Command HTTP proxy (TLS vaaditaan binäärille)
+  - type: privateService
+    name: vcp-core
+    runtime: docker
+    image:
+      url: tesla/vehicle-command:latest
+    plan: starter
+    region: frankfurt
+    autoDeploy: true
+    envVars:
+      - key: PORT
+        value: "14443"
+    # Varmista että lisäät Secret Filesit (ks. ohje alla):
+    #  /etc/secrets/fleet-key.pem
+    #  /etc/secrets/tls-key.pem
+    #  /etc/secrets/tls-cert.pem
+    startCommand: >
+      tesla-http-proxy
+      -host 0.0.0.0
+      -port 14443
+      -key-file /etc/secrets/fleet-key.pem
+      -tls-key /etc/secrets/tls-key.pem
+      -cert /etc/secrets/tls-cert.pem
+      -verbose
+    # Renderin Private Service kuuntelee vain sisäverkossa → ei public URL:ia
+
+  # B) PUBLIC: Nginx HTTP→HTTPS -siltakerros Renderin edgeä varten
+  - type: web
+    name: vcp-edge
+    runtime: docker
+    image:
+      url: nginx:alpine
+    plan: starter
+    region: frankfurt
+    autoDeploy: true
+    envVars:
+      - key: PORT
+        value: "10000"
+    startCommand: >
+      sh -lc 'cat >/etc/nginx/nginx.conf << "EOF"
+      events {}
+      http {
+        server {
+          listen 10000;
+          # Proxyaa HTTP-liikenteen sisäisesti vcp-core -> HTTPS:ään
+          location / {
+            proxy_pass https://vcp-core:14443;
+            proxy_ssl_verify off;
+            proxy_set_header Host $host;
+            proxy_set_header X-Forwarded-Proto https;
+            proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+          }
+        }
+      }
+      EOF
+      exec nginx -g "daemon off;"'
