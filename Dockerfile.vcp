@@ -1,8 +1,8 @@
-# Dockerfile.vcp
+# Dockerfile.vcp — ajaa teslamotors/vehicle-command -proxyn Renderissä
 FROM tesla/vehicle-command:latest
 
-# Render hoitaa TLS-terminoinnin portin yläpuolella, joten ajetaan HTTP:llä.
-# Syötetään yksityinen avain envistä tiedostoon ja käynnistetään proxy portissa 10000.
+# Render hoitaa TLS-terminoinnin → ajetaan kontissa HTTP:llä portissa 10000.
+# Luetaan yksityinen avain salaisesta env-muuttujasta ja kirj. tiedostoon.
 CMD ["/bin/sh", "-lc", "\
   mkdir -p /data && \
   printf \"%s\" \"$TESLA_PRIVATE_KEY_PEM\" > /data/fleet-key.pem && \
