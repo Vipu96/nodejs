@@ -1,5 +1,5 @@
 # Dockerfile.vcp — ajaa teslamotors/vehicle-command -proxyn Renderissä
-FROM tesla/vehicle-command:latest
+FROM teslamotors/vehicle-command:latest
 
 # Render hoitaa TLS-terminoinnin → ajetaan kontissa HTTP:llä portissa 10000.
 # Luetaan yksityinen avain salaisesta env-muuttujasta ja kirj. tiedostoon.
