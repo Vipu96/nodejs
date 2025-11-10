@@ -11,7 +11,7 @@ services:
     envVars:
       - key: PORT
         value: "14443"
-    startCommand: >
+    dockerCommand: >
       tesla-http-proxy
       -host 0.0.0.0
       -port 14443
@@ -32,7 +32,7 @@ services:
     envVars:
       - key: PORT
         value: "10000"
-    startCommand: >
+    dockerCommand: >
       sh -lc 'cat >/etc/nginx/nginx.conf << "EOF"
       events {}
       http {
