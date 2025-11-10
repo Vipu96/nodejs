@@ -1,0 +1,10 @@
+services:
+  - type: web
+    name: vcp-core
+    env: docker
+    plan: starter
+    healthCheckPath: /
+    dockerfilePath: ./Dockerfile.vcp
+    envVars:
+      - key: TESLA_PRIVATE_KEY_PEM
+        sync: false   # syötä arvo Renderin dashboardissa (ECDSA P-256 PEM)
