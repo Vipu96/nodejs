@@ -1,0 +1,19 @@
+# /etc/nginx/templates/default.conf.template
+server {
+  # Render asettaa aina $PORT-ympäristömuuttujan
+  listen       ${PORT};
+  listen       [::]:${PORT};
+
+  access_log /dev/stdout;
+  error_log  /dev/stderr;
+
+  location / {
+    # vcp-core = private-servicen nimi Renderin sisäverkossa
+    proxy_pass https://vcp-core:10000;
+    proxy_ssl_verify off;                 # upstream käyttää omaa TLS:ää
+    proxy_set_header Host $host;
+    proxy_set_header X-Forwarded-Proto https;
+    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+    # (tarvittaessa) proxy_ssl_server_name on;  # jos upstream vaatii SNI:tä
+  }
+}
