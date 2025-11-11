@@ -18,7 +18,7 @@ server {
     proxy_next_upstream error timeout http_502 http_503 http_504;
 
     # 🔐 Upstream on TLS
-    proxy_pass https://vcp-core:10000;
+    proxy_pass http://vcp-core:10000;
     proxy_ssl_verify off;
     proxy_ssl_server_name on;   # jos upstream vaatii SNI:tä
 
