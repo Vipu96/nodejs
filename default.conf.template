@@ -1,19 +1,29 @@
-# /etc/nginx/templates/default.conf.template
 server {
-  # Render asettaa aina $PORT-ympäristömuuttujan
   listen       ${PORT};
   listen       [::]:${PORT};
 
-  access_log /dev/stdout;
-  error_log  /dev/stderr;
+  # 🔑 Renderin sisä-DNS (päivitetty 2024→)
+  resolver 100.100.100.100 ipv6=off valid=30s;
+
+  # Health check gatewaylle (ei koske upstreamia)
+  location = /healthz {
+    add_header Content-Type text/plain;
+    return 200 "ok\n";
+  }
 
   location / {
-    # vcp-core = private-servicen nimi Renderin sisäverkossa
+    proxy_connect_timeout 5s;
+    proxy_send_timeout    30s;
+    proxy_read_timeout    30s;
+    proxy_next_upstream error timeout http_502 http_503 http_504;
+
+    # 🔐 Upstream on TLS
     proxy_pass https://vcp-core:10000;
-    proxy_ssl_verify off;                 # upstream käyttää omaa TLS:ää
+    proxy_ssl_verify off;
+    proxy_ssl_server_name on;   # jos upstream vaatii SNI:tä
+
     proxy_set_header Host $host;
     proxy_set_header X-Forwarded-Proto https;
     proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
-    # (tarvittaessa) proxy_ssl_server_name on;  # jos upstream vaatii SNI:tä
   }
 }
